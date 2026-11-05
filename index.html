@@ -861,12 +861,13 @@ function updateClock() {
 }
 
 /* ---------- 전등 스위치 ---------- */
-let lightsOn = true;
+let lightsOn = true, setLights = () => { };
 {
   const g = new THREE.Group(); g.position.set(X(1268) - 0.01, 0.75, Z(545)); g.rotation.y = -Math.PI / 2; scene.add(g);
   box(0.12, 0.18, 0.02, '#ffffff', 0, -0.09, 0, { parent: g, round: 0.01 });
   const sw = box(0.04, 0.07, 0.02, '#e9e4dc', 0, -0.035, 0.015, { parent: g, round: 0.006 }); sw.userData.keep = true;
-  addIt({ kind: 'switch', label: () => lightsOn ? '불 끄기' : '불 켜기', x: X(1240), z: Z(545), act: ch => { lightsOn = !lightsOn; sw.rotation.x = lightsOn ? 0 : 0.5; beep([1200], 0.02, 'square', 0.03); ch.say(lightsOn ? '💡' : '🌙'); applyLight(); } }, g);
+  addIt({ kind: 'switch', label: () => lightsOn ? '불 끄기' : '불 켜기', x: X(1240), z: Z(545), act: ch => { setLights(!lightsOn); beep([1200], 0.02, 'square', 0.03); ch.say(lightsOn ? '💡' : '🌙'); } }, g);
+  setLights = on => { if (lightsOn === on) return; lightsOn = on; sw.rotation.x = lightsOn ? 0 : 0.5; applyLight(); pushWorld(); };
 }
 const nightLight = new THREE.PointLight('#ffd9a0', 0, 7, 1.2); nightLight.position.set(X(1130), 1.6, Z(220)); scene.add(nightLight);
 let weatherSun = 1;
@@ -954,7 +955,8 @@ function steam(x, y, z) {
 
 const COPIER = { jam: false };
 function setJam(on) {
-  COPIER.jam = on;
+  if (COPIER.jam === on) return;
+  COPIER.jam = on; pushWorld();
   if (on) { let n = 0; tickers.push(dt => { if (!COPIER.jam) { COPIER.led.material = M('#7fb069', { e: '#7fb069', ei: 0.6 }); return false; } n += dt; COPIER.led.material = (n * 4 | 0) % 2 ? M('#e8574a', { e: '#e8574a', ei: 1.2 }) : M('#5a2a26'); }); }
 }
 /* ====================================================================
@@ -1641,9 +1643,11 @@ function heater(u, v, ry = 0) {
   const knob = mesh(new THREE.CylinderGeometry(0.025, 0.025, 0.02, 12), M('#9a8f84'), g, 0.24, 0.42, 0.06);
   const H = { g, glow, on: false, x: X(u), z: Z(v), t: 0 };
   H.set = on => {
+    if (H.on === on) return;
     H.on = on; glow.material = on ? M('#ff8a3d', { e: '#ff6a1a', ei: 1.4 }) : M('#e0d4c4');
     knob.rotation.y = on ? 1.2 : 0;
     if (on) { H.t = 0; npcEvent('heaterOn', H); }
+    pushWorld();
   };
   addExtra({ kind: 'heater', label: () => H.on ? '히터 끄기' : '히터 켜기', x: H.x, z: H.z, act: ch => { H.set(!H.on); beep(H.on ? [400, 520] : [380, 300], 0.06, 'triangle', 0.04); ch.say(H.on ? '따뜻~' : '끔'); if (ch === me && H.on) H.by = me; } }, g);
   heaters.push(H);
@@ -1804,7 +1808,7 @@ function npcNext(n) {
   const atHome = c.sitting === n.home;
   if (nm === '히터보안관') {
     if (heaters.some(h => h.on)) { const H = heaters.find(h => h.on); npcEvent('heaterOn', H); return n.plan; }
-    if (r < 0.35 && !(pantryWin.open && pantryDoor.hold)) return ventilatePlan(n);
+    if (r < 0.35 && isHost() && !(pantryWin.open && pantryDoor.hold)) return ventilatePlan(n);
     if (r < 0.65) return [...(atHome ? [] : homeBack(n)), Wt(6 + Math.random() * 8), Say(pick(n.def.idle))];
     if (r < 0.85) { const H = pick(heaters); return [G(H.x, H.z + 0.5), Wt(1.5), Say('누가 킨 거 아니죠?'), ...homeBack(n)]; }
     return [G(...wanderSpot()), Say('아휴 더워'), Wt(2), ...homeBack(n)];
@@ -1941,6 +1945,36 @@ function takenNames() {
   if (!room) return new Set();
   return new Set(room.peers().filter(p => !p.sameTab && p.presence && typeof p.presence.n === 'string').map(p => p.presence.n));
 }
+/* ---------- 사무실 상태 공유 (히터·불·창문·문·복사기) ---------- */
+let pendingPatrol = 0, applyingRemote = false, worldReady = false, lastWorldJ = {}, timeSkew = 0, manualPatrolSeen = 0;
+function netNow() { return Date.now() + timeSkew; }
+function isHost() { return !room || !room.isHost || room.isHost(); }
+function worldSnap() { return { h: heaters.map(H => H.on ? '1' : '0').join(''), l: lightsOn ? 1 : 0, w: pantryWin.open ? 1 : 0, d: pantryDoor.hold ? 1 : 0, j: COPIER.jam ? 1 : 0 }; }
+function pushWorld() {
+  try {
+    if (applyingRemote || !worldReady || !room || !room.setWorld) return;
+    const snap = worldSnap(), patch = {};
+    for (const [k, v] of Object.entries(snap)) { const j = JSON.stringify(v); if (lastWorldJ[k] !== j) { lastWorldJ[k] = j; patch[k] = v; } }
+    if (Object.keys(patch).length) room.setWorld(patch).catch(() => { });
+  } catch (e) { }
+}
+function applyWorld(v) {
+  applyingRemote = true;
+  try {
+    if (!v) return;
+    if (typeof v.h === 'string') heaters.forEach((H, i) => { const on = v.h[i] === '1'; if (H.on !== on) H.set(on); });
+    if (v.l === 0 || v.l === 1) setLights(v.l === 1);
+    if (v.w === 0 || v.w === 1) setPantryWin(v.w === 1);
+    if (v.d === 0 || v.d === 1) setPantryDoor(v.d === 1);
+    if (v.j === 0 || v.j === 1) setJam(v.j === 1);
+    for (const [k, val] of Object.entries(worldSnap())) lastWorldJ[k] = JSON.stringify(val);
+    if (typeof v.p === 'number' && v.p !== manualPatrolSeen) {
+      const fresh = manualPatrolSeen !== 0 || netNow() - v.p < 12000;
+      manualPatrolSeen = v.p;
+      if (fresh && netNow() - v.p < 12000 && !patrolOn) { if (phase !== 'work') { forced = 'work'; forcedT = 600; } pendingPatrol = performance.now(); }
+    }
+  } finally { applyingRemote = false; }
+}
 let snackTimer = 150;
 /* 무료 서버(Firebase) 연결 — github.io 등 Claude 밖에서 열릴 때 사용 */
 const FB_CFG = {
@@ -1952,7 +1986,7 @@ const FB_CFG = {
   messagingSenderId: "766230860631",
   appId: "1:766230860631:web:8139dd24fe6aa46dd02412"
 };
-const USE_FB = /github\.io$/.test(location.hostname) || /[?&]fb\b/.test(location.search);
+const USE_FB = /(github\.io|pages\.dev|web\.app|firebaseapp\.com|netlify\.app)$/.test(location.hostname) || /[?&]fb\b/.test(location.search);
 const FB_BASE = window.__FB_BASE || 'https://www.gstatic.com/firebasejs/11.10.0/';
 async function fbRoom(cfg) {
   const [A, U, D] = await Promise.all([import(FB_BASE + 'firebase-app.js'), import(FB_BASE + 'firebase-auth.js'), import(FB_BASE + 'firebase-database.js')]);
@@ -1965,7 +1999,9 @@ async function fbRoom(cfg) {
   const STALE = 45000;
   const fresh = v => v && typeof v.t === 'number' && Date.now() + skew - v.t < STALE;
   const emit = ch => { if (cb) cb({ joined: [], left: [], updated: [], ...ch }); };
-  D.onValue(D.ref(db, '.info/serverTimeOffset'), s => { skew = s.val() || 0; });
+  D.onValue(D.ref(db, '.info/serverTimeOffset'), s => { skew = s.val() || 0; timeSkew = skew; });
+  const worldRef = D.ref(db, 'world'); let worldCb = null, worldVal;
+  D.onValue(worldRef, s => { worldVal = s.val(); if (worldCb) worldCb(worldVal); });
   const upsert = s => {
     const v = s.val(); if (!v || typeof v !== 'object') return;
     const self = s.key === uid;
@@ -1984,6 +2020,9 @@ async function fbRoom(cfg) {
   });
   return {
     peers: () => [...peers.values()],
+    isHost: () => { let m = uid; for (const [k, p] of peers) if (!p.sameTab && fresh(p.presence) && k < m) m = k; return m === uid; },
+    onWorld(fn) { worldCb = fn; if (worldVal !== undefined) fn(worldVal); },
+    setWorld: patch => D.update(worldRef, patch),
     onPeers(fn) { cb = fn; },
     presence(obj) {
       const patch = {};
@@ -2012,6 +2051,7 @@ async function fbRoom(cfg) {
       renderOnline();
     }, () => { room = null; renderOnline(); });
     renderOnline();
+    if (room.onWorld) room.onWorld(v => { const first = !worldReady; worldReady = true; if (v) applyWorld(v); if (first && !v) { lastWorldJ = {}; pushWorld(); } });
     if (entered) sendPresence(true);
   } catch (e) { console.warn('연결 실패', e); room = null; }
 })();
@@ -2088,7 +2128,10 @@ const ceo = new Char('대표님', { ...DEFAULT_LOOK, skin: SKINS[1], hairStyle: 
 ceo.isNpc = true; ceo.speed = 1.15; ceo.anchor.visible = false; ceo.nm.classList.add('npc', 'ceo');
 NPC_NAMES.add('대표님');
 const ceoN = { char: ceo, plan: [], waitT: 0 };
-let patrolOn = false, ceoTimer = 240 + Math.random() * 200;
+let patrolOn = false, ceoTimer = 0, lastPatrolSlot = -1;
+/* 순찰 시간표: 모두에게 같은 시각 (7분마다 한 번, 그 안에서 시각은 날짜·시간으로 정해짐) */
+const PATROL_SLOT = 7 * 60000;
+function patrolOffset(slot) { let h = (slot * 2654435761) >>> 0; h ^= h >>> 15; h = Math.imul(h, 2246822519) >>> 0; return 30000 + (h % (4 * 60000)); }
 function startPatrol() {
   if (patrolOn || phase !== 'work') return;
   patrolOn = true;
@@ -2230,9 +2273,9 @@ const pantryWin = { open: false };
 function setPantryWin(open, ch) {
   if (pantryWin.open === open) return;
   pantryWin.open = open; tween(pantryWin.sash.position, 'x', open ? pantryWin.x0 - X(68) : pantryWin.x0, 0.5);
-  noise(0.4, 0.03, 1800); pantryWin.t = 0;
+  noise(0.4, 0.03, 1800); pantryWin.t = 0; pushWorld();
 }
-function setPantryDoor(hold) { if (pantryDoor.hold === hold) return; pantryDoor.hold = hold; pantryWin.t = 0; }
+function setPantryDoor(hold) { if (pantryDoor.hold === hold) return; pantryDoor.hold = hold; pantryWin.t = 0; pushWorld(); }
 addExtra({ kind: 'pwin', label: () => pantryWin.open ? '창문 닫기' : '창문 열기', x: X(1030), z: Z(150), act: ch => { setPantryWin(!pantryWin.open); ch.say(pantryWin.open ? '시원~' : '추워요..'); } }, pantryWin.sash);
 addExtra({ kind: 'pdoor', label: () => pantryDoor.hold ? '탕비실 문 닫기' : '탕비실 문 열어두기', x: pantryDoor.cx - 0.25, z: pantryDoor.cz, act: ch => { setPantryDoor(!pantryDoor.hold); ch.say(pantryDoor.hold ? '열어둠' : '쾅'); beep(pantryDoor.hold ? [300] : [160, 120], 0.06, 'triangle', 0.04); } });
 buildGrid();
@@ -2248,7 +2291,7 @@ function ventTick(dt) {
   if (pantryWin.open && Math.random() < dt * 1.2) leafIn();
   if (pantryWin.open || pantryDoor.hold) {
     pantryWin.t = (pantryWin.t || 0) + dt;
-    if (pantryWin.t > closeAt) {
+    if (pantryWin.t > closeAt && isHost()) {
       pantryWin.t = 0; closeAt = 15 + Math.random() * 20;
       const cands = npcs.filter(n => CLOSERS.includes(n.char.name) && !n.away && !n.leaving && !n.chase);
       if (cands.length) {
@@ -2261,7 +2304,7 @@ function ventTick(dt) {
     }
   }
   // 누군가 랜덤으로 히터를 켬 (오픈맨 제외)
-  if (phase === 'work') {
+  if (phase === 'work' && isHost()) {
     heaterAt -= dt;
     if (heaterAt <= 0) {
       heaterAt = 70 + Math.random() * 70;
@@ -2583,7 +2626,9 @@ function updateEvents(dt) {
   if (forced) { forcedT -= dt; if (forcedT <= 0) forced = null; }
   const want = forced || realPhase();
   if (want !== phase) { const prev = phase; phase = want; onPhase(prev, want); }
-  if (entered && phase === 'work' && !patrolOn) { ceoTimer -= dt; if (ceoTimer <= 0) startPatrol(); }
+  if (pendingPatrol && performance.now() - pendingPatrol > 4000) pendingPatrol = 0;
+  if (pendingPatrol && phase === 'work' && !patrolOn) { pendingPatrol = 0; startPatrol(); }
+  if (entered && phase === 'work' && !patrolOn) { const now = netNow(), slot = Math.floor(now / PATROL_SLOT); if (slot !== lastPatrolSlot) { const st = slot * PATROL_SLOT + patrolOffset(slot); if (now >= st && now < st + 8000) { lastPatrolSlot = slot; startPatrol(); } } }
   if (ceo.anchor.visible) runSeq(ceoN, dt);
   for (const { m } of wxPlanes) if (m.visible && m.material.map) { m.material.map.offset.y += dt * (weather === 'rain' ? 2.2 : 0.25); m.material.map.offset.x += dt * (weather === 'rain' ? 0.5 : Math.sin(T) * 0.05); }
   if (duck.visible) {
@@ -2599,7 +2644,7 @@ function updateEvents(dt) {
   menu.addEventListener('click', e => {
     const b = e.target.closest('button'); if (!b) return;
     const a = b.dataset.a; menu.classList.remove('on');
-    if (a === 'ceo') { if (phase !== 'work') { forced = 'work'; forcedT = 600; } setTimeout(startPatrol, 50); }
+    if (a === 'ceo') { if (phase !== 'work') { forced = 'work'; forcedT = 600; } if (room && room.setWorld) room.setWorld({ p: { '.sv': 'timestamp' } }).catch(() => { }); pendingPatrol = performance.now(); }
     if (a === 'lunch' || a === 'off' || a === 'work') { forced = a; forcedT = 600; }
     if (a === 'real') { forced = null; }
     if (a === 'wx') { const ks = Object.keys(WEATHERS); setWeather(ks[(ks.indexOf(weather) + 1) % ks.length]); banner(`${WEATHERS[weather][1]} 창밖 날씨: ${WEATHERS[weather][0]}`); }
